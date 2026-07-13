@@ -993,34 +993,53 @@ async function finishSession() {
   btn.textContent = 'Saving…';
 
   try {
-    const tasks = [];
+    const toClear = []; // { id, i } pairs already safe to clear (saved and confirmed)
+    const tasks = []; // { id, i, promise } pairs still needing a server round-trip
+
     cards.forEach(id => {
       for (let i = 0; i < SETS[id]; i++) {
         const input = document.querySelector(`#row-${id}-${i} .weight-input`);
         if (!input) continue;
         const val = input.value;
         if (!val) continue;
-        if (committedValues[`${id}-${i}`] === val) continue; // already saved, unchanged
+
+        if (committedValues[`${id}-${i}`] === val) {
+          toClear.push({ id, i }); // already saved, unchanged
+          continue;
+        }
 
         const weight = Number(val);
         if (Number.isNaN(weight) || weight <= 0) continue;
-        tasks.push(saveWeightToServer(id, i, weight));
+        tasks.push({ id, i, promise: saveWeightToServer(id, i, weight) });
       }
     });
 
-    await Promise.all(tasks);
-
-    cards.forEach(id => {
-      for (let i = 0; i < SETS[id]; i++) {
-        const input = document.querySelector(`#row-${id}-${i} .weight-input`);
-        if (input) input.value = '';
-        localStorage.removeItem(`w-${id}-${i}`);
-        delete committedValues[`${id}-${i}`];
-        setSyncStatus(id, i, null);
-      }
-      document.getElementById(id).classList.remove('done');
-      localStorage.removeItem(`done-${id}`);
+    const results = await Promise.all(tasks.map(t => t.promise));
+    let failedCount = 0;
+    tasks.forEach((t, idx) => {
+      if (results[idx]) toClear.push({ id: t.id, i: t.i });
+      else failedCount++;
     });
+
+    // Only clear inputs that are confirmed saved — a failed save keeps its
+    // value in the field (and localStorage) so nothing is silently lost.
+    toClear.forEach(({ id, i }) => {
+      const input = document.querySelector(`#row-${id}-${i} .weight-input`);
+      if (input) input.value = '';
+      localStorage.removeItem(`w-${id}-${i}`);
+      delete committedValues[`${id}-${i}`];
+      setSyncStatus(id, i, null);
+    });
+
+    if (failedCount > 0) {
+      const verb = failedCount > 1 ? 'were' : 'was';
+      alert(`${failedCount} weight${failedCount > 1 ? 's' : ''} failed to save and ${verb} left in the field — check your connection and try again.`);
+    } else {
+      cards.forEach(id => {
+        document.getElementById(id).classList.remove('done');
+        localStorage.removeItem(`done-${id}`);
+      });
+    }
 
     updateProgress();
   } finally {
