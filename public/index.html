@@ -290,7 +290,12 @@
   body.day-wed .progress-fill { background: var(--wed); }
   body.day-sat .progress-fill { background: var(--sat); }
 
-  /* reset */
+  /* reset / finish */
+  .action-row {
+    display: flex;
+    gap: 8px;
+    margin: 0 20px 16px;
+  }
   .reset-btn {
     background: none;
     border: 1px solid var(--border);
@@ -298,10 +303,26 @@
     color: var(--muted);
     font-size: 12px;
     font-family: var(--font);
-    padding: 6px 10px;
+    padding: 8px 12px;
     cursor: pointer;
-    margin: 0 20px 16px;
   }
+  .finish-btn {
+    flex: 1;
+    background: var(--mon);
+    border: none;
+    border-radius: 8px;
+    color: #000;
+    font-size: 13px;
+    font-weight: 700;
+    font-family: var(--font);
+    padding: 8px 12px;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .finish-btn:active { opacity: 0.8; }
+  .finish-btn:disabled { opacity: 0.5; cursor: default; }
+  body.day-wed .finish-btn { background: var(--wed); }
+  body.day-sat .finish-btn { background: var(--sat); }
 
   /* WEIGHT ROW v2 - with history label + icon */
   .weight-row {
@@ -479,7 +500,10 @@
 </div>
 
 <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
-<button class="reset-btn" onclick="resetDay()">Reset day</button>
+<div class="action-row">
+  <button class="reset-btn" onclick="resetDay()">Reset day</button>
+  <button class="finish-btn" id="finish-btn" onclick="finishSession()">Finish session</button>
+</div>
 
 <!-- MON -->
 <div class="day-panel active" id="panel-mon">
@@ -740,6 +764,10 @@ let currentDay = 'mon';
 // In-memory cache of history: { 'mon-0': { 0: [{weight,date}, ...], 1: [...] }, ... }
 const historyCache = {};
 
+// Tracks which "id-setIndex" values have already been posted to the server,
+// so Finish Session only re-saves values that changed since the last save.
+const committedValues = {};
+
 // ── INIT ──────────────────────────────────────────────────────
 function init() {
   // Build weight input rows for every exercise (placeholder state, no history yet)
@@ -770,6 +798,7 @@ function renderWeightRows(id, savedValuesOnly = true) {
     row.className = 'weight-row';
     row.id = `row-${id}-${i}`;
     const saved = localStorage.getItem(`w-${id}-${i}`) || '';
+    if (saved) committedValues[`${id}-${i}`] = saved;
     row.innerHTML = `
       <span class="set-label">S${i+1}</span>
       <input class="weight-input" type="number" inputmode="decimal"
@@ -908,16 +937,7 @@ function resetDay() {
 // ── WEIGHT SAVE ───────────────────────────────────────────────
 // Local cache is instant (so the input never feels laggy); the KV write
 // happens in the background and only updates the history label/dot on completion.
-async function commitWeight(id, setIndex, val) {
-  if (!val) {
-    localStorage.removeItem(`w-${id}-${setIndex}`);
-    return;
-  }
-  localStorage.setItem(`w-${id}-${setIndex}`, val);
-
-  const weight = Number(val);
-  if (Number.isNaN(weight) || weight <= 0) return;
-
+async function saveWeightToServer(id, setIndex, weight) {
   setSyncStatus(id, setIndex, 'saving');
   try {
     const res = await fetch('/api/weights', {
@@ -933,11 +953,98 @@ async function commitWeight(id, setIndex, val) {
     historyCache[id][setIndex] = data.history;
     updateHistoryLabel(id, setIndex);
 
+    committedValues[`${id}-${setIndex}`] = String(weight);
     setSyncStatus(id, setIndex, 'saved');
     setTimeout(() => setSyncStatus(id, setIndex, null), 2000);
+    return true;
   } catch (err) {
     console.error('Save error:', err);
     setSyncStatus(id, setIndex, 'error');
+    return false;
+  }
+}
+
+async function commitWeight(id, setIndex, val) {
+  if (!val) {
+    localStorage.removeItem(`w-${id}-${setIndex}`);
+    delete committedValues[`${id}-${setIndex}`];
+    return;
+  }
+  localStorage.setItem(`w-${id}-${setIndex}`, val);
+
+  const weight = Number(val);
+  if (Number.isNaN(weight) || weight <= 0) return;
+
+  await saveWeightToServer(id, setIndex, weight);
+}
+
+// ── FINISH SESSION ───────────────────────────────────────────
+// Commits any values the user typed but never blurred out of (so nothing
+// is lost), waits for all saves to land in the DB, then clears every
+// weight input and checkmark for the current day.
+async function finishSession() {
+  const cards = DAY_CARDS[currentDay];
+  if (!cards) return;
+
+  if (!confirm("Save this session's weights and clear the board for next time?")) return;
+
+  const btn = document.getElementById('finish-btn');
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+
+  try {
+    const toClear = []; // { id, i } pairs already safe to clear (saved and confirmed)
+    const tasks = []; // { id, i, promise } pairs still needing a server round-trip
+
+    cards.forEach(id => {
+      for (let i = 0; i < SETS[id]; i++) {
+        const input = document.querySelector(`#row-${id}-${i} .weight-input`);
+        if (!input) continue;
+        const val = input.value;
+        if (!val) continue;
+
+        if (committedValues[`${id}-${i}`] === val) {
+          toClear.push({ id, i }); // already saved, unchanged
+          continue;
+        }
+
+        const weight = Number(val);
+        if (Number.isNaN(weight) || weight <= 0) continue;
+        tasks.push({ id, i, promise: saveWeightToServer(id, i, weight) });
+      }
+    });
+
+    const results = await Promise.all(tasks.map(t => t.promise));
+    let failedCount = 0;
+    tasks.forEach((t, idx) => {
+      if (results[idx]) toClear.push({ id: t.id, i: t.i });
+      else failedCount++;
+    });
+
+    // Only clear inputs that are confirmed saved — a failed save keeps its
+    // value in the field (and localStorage) so nothing is silently lost.
+    toClear.forEach(({ id, i }) => {
+      const input = document.querySelector(`#row-${id}-${i} .weight-input`);
+      if (input) input.value = '';
+      localStorage.removeItem(`w-${id}-${i}`);
+      delete committedValues[`${id}-${i}`];
+      setSyncStatus(id, i, null);
+    });
+
+    if (failedCount > 0) {
+      const verb = failedCount > 1 ? 'were' : 'was';
+      alert(`${failedCount} weight${failedCount > 1 ? 's' : ''} failed to save and ${verb} left in the field — check your connection and try again.`);
+    } else {
+      cards.forEach(id => {
+        document.getElementById(id).classList.remove('done');
+        localStorage.removeItem(`done-${id}`);
+      });
+    }
+
+    updateProgress();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Finish session';
   }
 }
 

@@ -12,7 +12,22 @@
 // Storage shape in KV: one key per exercise+set, e.g. "history:mon-0:0"
 // Value: JSON array of { weight, date }, capped at 50 entries (newest first)
 
-import { kv } from '@vercel/kv';
+import { createClient } from '@vercel/kv';
+
+// The Redis store is connected via Vercel's Upstash marketplace integration,
+// which namespaces its env vars per-database (e.g. GYMHISTORY_KV_REST_API_URL)
+// instead of the plain KV_REST_API_URL/KV_REST_API_TOKEN the default `kv`
+// export looks for. Resolve whichever is present.
+function resolveEnv(suffix) {
+  if (process.env[suffix]) return process.env[suffix];
+  const match = Object.keys(process.env).find((k) => k.endsWith(`_${suffix}`));
+  return match ? process.env[match] : undefined;
+}
+
+const kv = createClient({
+  url: resolveEnv('KV_REST_API_URL'),
+  token: resolveEnv('KV_REST_API_TOKEN'),
+});
 
 const MAX_HISTORY = 50;
 
